@@ -12,17 +12,23 @@
 
 使用前：
 - 安装依赖：pip install openai
-- 把下面 DEEPSEEK_API_KEY 替换成你的 DeepSeek API key
+- 运行时通过 --deepseek_api 传入你的 DeepSeek API key
 """
 
 from __future__ import annotations
 
 import json
+import argparse
 import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 # ========================= 0. DeepSeek 客户端 =========================
 
@@ -30,11 +36,13 @@ from openai import OpenAI
 DEEPSEEK_API_KEY = "待填"
 
 
-def make_deepseek_client() -> OpenAI:
+def make_deepseek_client() -> "OpenAI":
     """
     构造一个指向 DeepSeek API 的 OpenAI 兼容客户端。
     不依赖环境变量，直接使用上面的 DEEPSEEK_API_KEY。
     """
+    if OpenAI is None:
+        raise ImportError("缺少依赖 openai，请先执行 pip install openai")
     return OpenAI(
         api_key=DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com",  # DeepSeek 官方 base_url
@@ -459,13 +467,96 @@ FEATURES: List[Feature] = [
 ]
 
 
-def add_feature_nodes_to_tree(tree: ConsequenceTree) -> Dict[str, str]:
+def _col_letters_to_index(letters: str) -> int:
+    idx = 0
+    for ch in letters:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def read_xlsx_first_sheet(path: str) -> List[Dict[str, str]]:
+    """仅用标准库读取 xlsx 第一张表，返回 list[dict]。"""
+    ns = {
+        "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+
+    with zipfile.ZipFile(path) as zf:
+        # shared strings
+        sst: List[str] = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            sst_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in sst_root.findall("m:si", ns):
+                text = "".join((t.text or "") for t in si.iterfind(".//m:t", ns))
+                sst.append(text)
+
+        wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
+        rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {r.attrib["Id"]: r.attrib["Target"] for r in rels_root}
+
+        first_sheet = wb_root.find("m:sheets/m:sheet", ns)
+        if first_sheet is None:
+            return []
+
+        rid = first_sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        if not rid or rid not in rel_map:
+            return []
+
+        target = rel_map[rid]
+        sheet_path = target if target.startswith("xl/") else f"xl/{target}"
+        ws_root = ET.fromstring(zf.read(sheet_path))
+
+        matrix: List[List[str]] = []
+        for row in ws_root.findall("m:sheetData/m:row", ns):
+            row_values: List[str] = []
+            for cell in row.findall("m:c", ns):
+                ref = cell.attrib.get("r", "")
+                col_letters = "".join(ch for ch in ref if ch.isalpha())
+                col_idx = _col_letters_to_index(col_letters) if col_letters else len(row_values)
+                while len(row_values) < col_idx:
+                    row_values.append("")
+
+                cell_type = cell.attrib.get("t")
+                v = cell.find("m:v", ns)
+                if v is None:
+                    value = ""
+                elif cell_type == "s":
+                    value = sst[int(v.text)]
+                else:
+                    value = v.text or ""
+                row_values.append(value)
+            matrix.append(row_values)
+
+    if not matrix:
+        return []
+
+    headers = matrix[0]
+    records: List[Dict[str, str]] = []
+    for row in matrix[1:]:
+        if not any(str(x).strip() for x in row):
+            continue
+        rec = {h: (row[i] if i < len(row) else "") for i, h in enumerate(headers)}
+        records.append(rec)
+    return records
+
+
+def build_features_from_dataset(records: List[Dict[str, str]]) -> List[Feature]:
+    if not records:
+        return FEATURES
+    headers = list(records[0].keys())
+    delta_cols = [h for h in headers if h.startswith("delta_")]
+    if not delta_cols:
+        return FEATURES
+    return [Feature(id=col, label=col, description=f"数据集指标列: {col}") for col in delta_cols]
+
+
+def add_feature_nodes_to_tree(tree: ConsequenceTree, features: List[Feature]) -> Dict[str, str]:
     """
     把 FEATURES 中的每个 Feature 加入树, 作为 node_type="feature" 的节点。
     返回 feature_id -> node_id 的映射。
     """
     feature_id_to_node_id: Dict[str, str] = {}
-    for feat in FEATURES:
+    for feat in features:
         nid = f"feat::{feat.id}"
         node = Node(
             id=nid,
@@ -576,6 +667,7 @@ def attach_features(
     tree: ConsequenceTree,
     feature_linker: FeatureLinker,
     feature_id_to_node_id: Dict[str, str],
+    features: List[Feature],
     max_links_per_node: int = 3,
     verbose: bool = True,   # 这里也加可视化日志
 ) -> None:
@@ -598,7 +690,7 @@ def attach_features(
             print(f"[Feature Mapping] ({idx}/{total}) 节点: {preview}...")
 
         links = feature_linker.link_node_to_features(
-            node, FEATURES, max_links=max_links_per_node
+            node, features, max_links=max_links_per_node
         )
 
         if verbose:
@@ -637,13 +729,13 @@ def pretty_print_tree(tree: ConsequenceTree, root_id: str, indent: int = 0) -> N
         pretty_print_tree(tree, child.id, indent + 1)
 
 
-def print_feature_upstreams(tree: ConsequenceTree) -> None:
+def print_feature_upstreams(tree: ConsequenceTree, features: List[Feature]) -> None:
     """
     打印每个特征节点的直接上游中间后果节点 (一跳)。
     可以扩展成多跳回溯路径。
     """
     print("\n=== 每个特征节点的直接上游后果 ===")
-    for feat in FEATURES:
+    for feat in features:
         fid = f"feat::{feat.id}"
         if fid not in tree.nodes:
             continue
@@ -658,8 +750,161 @@ def print_feature_upstreams(tree: ConsequenceTree) -> None:
 
 # ========================= 6. 示例主程序 =========================
 
+def evaluate_sample(tree: ConsequenceTree, expected_changes: Dict) -> Dict:
+    predicted: Dict[str, str] = {}
+    vote_box: Dict[str, Dict[str, int]] = {}
+    for e in tree.edges:
+        if not e.relation_type.startswith("feature_"):
+            continue
+        direction = e.relation_type.replace("feature_", "")
+        fid = e.child_id.replace("feat::", "")
+        vote_box.setdefault(fid, {})
+        vote_box[fid][direction] = vote_box[fid].get(direction, 0) + 1
+
+    for fid, votes in vote_box.items():
+        predicted[fid] = sorted(votes.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+
+    expected_up = expected_changes.get("expected_up", [])
+    expected_down = expected_changes.get("expected_down", [])
+    side_up = expected_changes.get("expected_side_effect_up", [])
+    side_down = expected_changes.get("expected_side_effect_down", [])
+
+    def _check(ids: List[str], target: str) -> Tuple[int, List[str]]:
+        hits = [fid for fid in ids if predicted.get(fid) == target]
+        return len(hits), hits
+
+    up_hits, up_hit_ids = _check(expected_up, "increase")
+    down_hits, down_hit_ids = _check(expected_down, "decrease")
+    side_up_hits, side_up_hit_ids = _check(side_up, "increase")
+    side_down_hits, side_down_hit_ids = _check(side_down, "decrease")
+
+    total_expected = len(expected_up) + len(expected_down) + len(side_up) + len(side_down)
+    total_hits = up_hits + down_hits + side_up_hits + side_down_hits
+    score = (total_hits / total_expected) if total_expected else 0.0
+
+    return {
+        "score": round(score, 4),
+        "total_expected": total_expected,
+        "total_hits": total_hits,
+        "predicted": predicted,
+        "hit_details": {
+            "expected_up": up_hit_ids,
+            "expected_down": down_hit_ids,
+            "expected_side_effect_up": side_up_hit_ids,
+            "expected_side_effect_down": side_down_hit_ids,
+        },
+    }
+
+
+def run_dataset(args: argparse.Namespace) -> None:
+    global DEEPSEEK_API_KEY
+    DEEPSEEK_API_KEY = (args.deepseek_api or "").strip() or DEEPSEEK_API_KEY
+
+    records = read_xlsx_first_sheet(args.dataset)
+    if not records:
+        print(f"未从数据集读取到样本: {args.dataset}")
+        return
+
+    features = build_features_from_dataset(records)
+    to_run = records[: args.max_samples] if args.max_samples > 0 else records
+
+    if OpenAI is None:
+        print("⚠️ 缺少 openai 依赖，无法调用模型。将输出每条样本的 skipped 结果。")
+    elif DEEPSEEK_API_KEY.strip() == "待填":
+        print("⚠️ DEEPSEEK_API_KEY 未配置，无法调用模型。将输出每条样本的 skipped 结果。")
+
+    results = []
+    for idx, row in enumerate(to_run, start=1):
+        sid = row.get("样本ID", f"row_{idx}")
+        policy = row.get("政策名称（中/英）", "")
+        desc = row.get("简要说明（现实中确实发生）", "")
+        country = row.get("国家", "")
+        year = row.get("年份", "")
+        ptype = row.get("政策类型", "")
+
+        print(f"\n===== 样本 {idx}/{len(to_run)}: ID={sid}, 政策={policy} =====")
+
+        if OpenAI is None or DEEPSEEK_API_KEY.strip() == "待填":
+            reason = "缺少 openai 依赖" if OpenAI is None else "DEEPSEEK_API_KEY 未配置"
+            result = {
+                "sample_id": sid,
+                "policy": policy,
+                "status": "skipped",
+                "reason": reason,
+            }
+            results.append(result)
+            print(f"结果: {result}")
+            continue
+
+        decision_description = f"{policy}。{desc}".strip("。")
+        context = f"国家: {country}; 年份: {year}; 政策类型: {ptype}"
+
+        generator = LLMConsequenceGenerator(model_name=args.model_name, temperature=args.temperature)
+        builder = ConsequenceTreeBuilder(
+            generator=generator,
+            max_depth=args.max_depth,
+            max_branch=args.max_branch,
+            verbose=args.verbose,
+        )
+
+        try:
+            tree = builder.build_tree(decision_description=decision_description, context=context, root_text=policy)
+            feature_id_to_node_id = add_feature_nodes_to_tree(tree, features)
+            feature_linker = FeatureLinker(model_name=args.model_name, temperature=args.link_temperature)
+            attach_features(
+                tree,
+                feature_linker,
+                feature_id_to_node_id,
+                features=features,
+                max_links_per_node=args.max_links_per_node,
+                verbose=args.verbose,
+            )
+            expected_raw = row.get("gov_expected_changes", "{}")
+            expected = json.loads(expected_raw) if expected_raw else {}
+            eval_result = evaluate_sample(tree, expected)
+
+            result = {
+                "sample_id": sid,
+                "policy": policy,
+                "status": "ok",
+                "evaluation": eval_result,
+            }
+            results.append(result)
+            print(f"结果: score={eval_result['score']}, hits={eval_result['total_hits']}/{eval_result['total_expected']}")
+        except Exception as e:
+            result = {
+                "sample_id": sid,
+                "policy": policy,
+                "status": "error",
+                "reason": str(e),
+            }
+            results.append(result)
+            print(f"结果: {result}")
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"\n已输出 {len(results)} 条样本验证结果到: {args.output}")
+
+
 if __name__ == "__main__":
-    # ====== 示例: 日本全国现金补贴决策 ======
+    parser = argparse.ArgumentParser(description="政策样本批量运行与验证")
+    parser.add_argument("--dataset", default="LLM政策数据集.xlsx")
+    parser.add_argument("--output", default="sample_validation_results.json")
+    parser.add_argument("--max-samples", type=int, default=0, help="0 表示全量")
+    parser.add_argument("--model-name", default="deepseek-reasoner")
+    parser.add_argument("--temperature", type=float, default=0.4)
+    parser.add_argument("--link-temperature", type=float, default=0.2)
+    parser.add_argument("--max-depth", type=int, default=3)
+    parser.add_argument("--max-branch", type=int, default=4)
+    parser.add_argument("--max-links-per-node", type=int, default=3)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--deepseek_api", default="", help="DeepSeek API Key")
+    args = parser.parse_args()
+    run_dataset(args)
+
+    # 兼容旧示例: 如需单样本示例流程，可在后续按需恢复
+    # ====== 以下旧示例保留为注释参考 ======
+    '''
     decision_description = (
         "中央政府在通胀压力和需求低迷的背景下，向全国居民一次性发放现金补贴，"
         "金额按人头统一，不根据收入差异调整。"
@@ -723,4 +968,5 @@ if __name__ == "__main__":
         print("未找到根节点。")
 
     # 6) 打印每个特征的直接上游后果节点
-    print_feature_upstreams(tree)
+    print_feature_upstreams(tree, FEATURES)
+    '''
