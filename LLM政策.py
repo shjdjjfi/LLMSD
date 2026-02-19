@@ -750,7 +750,7 @@ def print_feature_upstreams(tree: ConsequenceTree, features: List[Feature]) -> N
 
 # ========================= 6. 示例主程序 =========================
 
-def evaluate_sample(tree: ConsequenceTree, expected_changes: Dict) -> Dict:
+def evaluate_sample(tree: ConsequenceTree, expected_changes: Dict, sample_row: Dict[str, str]) -> Dict:
     predicted: Dict[str, str] = {}
     vote_box: Dict[str, Dict[str, int]] = {}
     for e in tree.edges:
@@ -782,6 +782,57 @@ def evaluate_sample(tree: ConsequenceTree, expected_changes: Dict) -> Dict:
     total_hits = up_hits + down_hits + side_up_hits + side_down_hits
     score = (total_hits / total_expected) if total_expected else 0.0
 
+    # ===== 额外评估1：政府未关注指标的模型命中率 =====
+    actual_directions: Dict[str, str] = {}
+    for col, raw in sample_row.items():
+        if not col.startswith("delta_"):
+            continue
+        text = str(raw).strip()
+        if text == "":
+            continue
+        try:
+            value = float(text)
+        except ValueError:
+            continue
+        if value > 0:
+            actual_directions[col] = "increase"
+        elif value < 0:
+            actual_directions[col] = "decrease"
+        else:
+            actual_directions[col] = "flat"
+
+    focus_expected: Dict[str, str] = {}
+    for fid in expected_up + side_up:
+        focus_expected[fid] = "increase"
+    for fid in expected_down + side_down:
+        focus_expected[fid] = "decrease"
+
+    unexpected_ids = [fid for fid in actual_directions.keys() if fid not in focus_expected]
+    unexpected_eval_ids = [fid for fid in unexpected_ids if fid in predicted and actual_directions[fid] in ("increase", "decrease")]
+    unexpected_hits = [
+        fid for fid in unexpected_eval_ids
+        if predicted.get(fid) == actual_directions.get(fid)
+    ]
+    unexpected_hit_rate = (len(unexpected_hits) / len(unexpected_eval_ids)) if unexpected_eval_ids else 0.0
+
+    # ===== 额外评估2：关注指标中 模型命中率 / 政府命中率 =====
+    focus_eval_ids = [fid for fid in focus_expected.keys() if fid in actual_directions and actual_directions[fid] in ("increase", "decrease")]
+    model_focus_hits = [
+        fid for fid in focus_eval_ids
+        if predicted.get(fid) == actual_directions.get(fid)
+    ]
+    gov_focus_hits = [
+        fid for fid in focus_eval_ids
+        if focus_expected.get(fid) == actual_directions.get(fid)
+    ]
+
+    focus_total = len(focus_eval_ids)
+    model_focus_hit_rate = (len(model_focus_hits) / focus_total) if focus_total else 0.0
+    gov_focus_hit_rate = (len(gov_focus_hits) / focus_total) if focus_total else 0.0
+    model_vs_gov_focus_hit_rate_ratio = (
+        model_focus_hit_rate / gov_focus_hit_rate if gov_focus_hit_rate > 0 else None
+    )
+
     return {
         "score": round(score, 4),
         "total_expected": total_expected,
@@ -792,6 +843,20 @@ def evaluate_sample(tree: ConsequenceTree, expected_changes: Dict) -> Dict:
             "expected_down": down_hit_ids,
             "expected_side_effect_up": side_up_hit_ids,
             "expected_side_effect_down": side_down_hit_ids,
+        },
+        "unexpected_indicator_hit_rate": {
+            "value": round(unexpected_hit_rate, 4),
+            "hits": len(unexpected_hits),
+            "total": len(unexpected_eval_ids),
+            "hit_ids": unexpected_hits,
+        },
+        "focus_indicator_model_vs_gov": {
+            "focus_total": focus_total,
+            "model_hit_rate": round(model_focus_hit_rate, 4),
+            "gov_hit_rate": round(gov_focus_hit_rate, 4),
+            "model_vs_gov_hit_rate_ratio": None if model_vs_gov_focus_hit_rate_ratio is None else round(model_vs_gov_focus_hit_rate_ratio, 4),
+            "model_hit_ids": model_focus_hits,
+            "gov_hit_ids": gov_focus_hits,
         },
     }
 
@@ -861,7 +926,7 @@ def run_dataset(args: argparse.Namespace) -> None:
             )
             expected_raw = row.get("gov_expected_changes", "{}")
             expected = json.loads(expected_raw) if expected_raw else {}
-            eval_result = evaluate_sample(tree, expected)
+            eval_result = evaluate_sample(tree, expected, row)
 
             result = {
                 "sample_id": sid,
@@ -870,7 +935,11 @@ def run_dataset(args: argparse.Namespace) -> None:
                 "evaluation": eval_result,
             }
             results.append(result)
-            print(f"结果: score={eval_result['score']}, hits={eval_result['total_hits']}/{eval_result['total_expected']}")
+            print(
+                f"结果: score={eval_result['score']}, hits={eval_result['total_hits']}/{eval_result['total_expected']}, "
+                f"unexpected_hit_rate={eval_result['unexpected_indicator_hit_rate']['value']}, "
+                f"model/gov={eval_result['focus_indicator_model_vs_gov']['model_vs_gov_hit_rate_ratio']}"
+            )
         except Exception as e:
             result = {
                 "sample_id": sid,
