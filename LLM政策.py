@@ -27,7 +27,7 @@ from openai import OpenAI
 # ========================= 0. DeepSeek 客户端 =========================
 
 # ⚠️ 在这里填你的 DeepSeek Key（字符串）
-DEEPSEEK_API_KEY = "sk-e1a3c2bbb56c4398ae6d2a621950e70b"
+DEEPSEEK_API_KEY = "待填"
 
 
 def make_deepseek_client() -> OpenAI:
